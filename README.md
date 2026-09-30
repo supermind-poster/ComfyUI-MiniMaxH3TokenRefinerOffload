@@ -1,86 +1,34 @@
+# MiniMax H3 Token Refiner — norefiner-style offload v3
 
-# MiniMax H3 Token Refiner — Cache + CPU Offload
+Goal: during sampling the model behaves like `MiniMax-H3-...-norefiner` (the Token Refiner is not part of
+the loaded model), but the conditioning is still refined exactly like in the original checkpoint.
 
-Custom ComfyUI node for the current `MiniMaxH3Model`.
+## How current ComfyUI uses the refiner
 
-## What it does
+`MiniMaxH3.extra_conds` calls `preprocess_text_embeds` (condition_proj + token_refiner) **once per
+conditioning at the start of sampling**. `_forward` then receives already-refined text tokens and skips the
+refiner. So there is nothing to cache per step - v3 has no cache (v2's identity-keyed cache is removed:
+it could return stale results when a freed GPU address was reused).
 
-Current ComfyUI runs the H3 `token_refiner` inside `_forward()` whenever the
-Qwen3-VL context is 5120-dimensional. It is therefore called again on every
-denoising call, not only once.
+## What the node does
 
-This node:
+* Replaces `diffusion_model.token_refiner` with a parameter-free stand-in via a ModelPatcher **object patch**
+  (clone-local, undone automatically on unpatch; the shared base model is never mutated permanently).
+* The real refiner is not in the module tree: ModelPatcher never loads/pins/streams it and it is not in
+  `state_dict()`. It stays in system RAM (~1.4 GiB for the int8 model).
+* When ComfyUI asks for the refined conditioning, the real refiner runs with ComfyUI's per-layer weight
+  casting: each layer copies only its own weight to the GPU for its matmul. Nothing stays resident afterwards
+  (weights that were left on the GPU by an earlier load are moved back to CPU; `empty_cache()` is called).
+  Output is bit-identical to the original refiner.
+* Subtracts the refiner size from the patcher's `model_size()` so full-load/partial-load decisions match the
+  norefiner checkpoint.
 
-1. clones the input MODEL;
-2. detects the MiniMax H3 diffusion model;
-3. records the source conditioning tensor identity;
-4. lets the real Token Refiner execute once for each distinct conditioning
-   tensor (normally positive and negative CFG contexts);
-5. caches the refined 5376-dimensional text embedding;
-6. moves the Token Refiner module to CPU;
-7. on later denoise calls, returns the cached embedding without running the
-   refiner attention/MLP;
-8. if a genuinely new conditioning tensor appears, temporarily moves the
-   refiner back to the compute device, computes it once, caches it, and
-   offloads again.
+## Notes
 
-The 50 main H3 blocks are not modified.
-
-## Installation
-
-Copy the folder:
-
-`MiniMaxH3TokenRefinerOffload`
-
-to:
-
-`ComfyUI/custom_nodes/`
-
-Then restart ComfyUI.
-
-## Workflow
-
-```text
-Load Diffusion Model
-        |
-        v
-MiniMax H3 Token Refiner — Cache + CPU Offload
-        |
-        v
-your existing H3 optimization nodes / sampler
-```
-
-Put it as early as practical in the MODEL chain, before nodes that execute
-the model.
-
-## Important
-
-This is deliberately implemented as a runtime cache, not as a checkpoint
-conversion. The first occurrence of each conditioning tensor still executes
-the original refiner, so the first pass preserves the original H3 computation.
-Subsequent calls reuse the exact refined tensor.
-
-The node uses the current ComfyUI H3 object structure:
-`diffusion_model.condition_proj -> token_refiner -> blocks/final_norm`.
-
-If another custom node replaces `condition_proj`, `token_refiner`, or their
-forward methods, place this node after that node or disable one of the
-conflicting patches.
-
-## Expected VRAM behavior
-
-The two refiner blocks can be large. Once a conditioning has been refined,
-their parameters are moved to CPU and CUDA cache is emptied. The cached
-5376-dimensional text features remain on the GPU because the main H3 blocks
-need them on every denoise call.
-
-The exact VRAM reduction depends on the checkpoint, quantization method, and
-ComfyUI casting implementation.
-
-## Safety
-
-The node works on a cloned MODEL. It does not edit ComfyUI's source files and
-does not globally monkey-patch `MiniMaxH3Model`.
-
-After disabling/removing the node, restart ComfyUI if another custom node has
-also modified the same H3 modules.
+* Put all LoRA nodes **before** this node. LoRA patches that target `token_refiner.*` raise an error.
+* Cost vs. the norefiner file: ~1.4 GiB extra system RAM, and a short refiner run per conditioning
+  (positive/negative) at the start of every sampling.
+* `debug=true` logs GPU allocated MiB before/after each refiner run and whether refiner weights are on GPU.
+* With dynamic VRAM (aimdo), modules that already own a VBAR are left to ComfyUI and not moved by hand.
+* If the base model was previously loaded *without* this node in the same session, use "Unload models" once
+  so no stale refiner copy stays on the GPU.
